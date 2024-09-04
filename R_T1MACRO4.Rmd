@@ -1,0 +1,510 @@
+---
+title: "R_T1MACRO4"
+author: "Joaquín Martínez"
+date: "2024-09-03"
+output: pdf_document
+---
+# Preliminar
+
+Ajustar el directorio!!
+```{r directorio}
+# Directorio
+setwd("/Users/joaquin/Desktop/Tarea1ENMAC455")
+```
+
+Funciones paquetes y objetos
+```{r packages}
+# Instalar paquetes
+packages <- c("haven", "ggplot2", "plyr", "tidyr", "dplyr", "lfe", "readxl", "stargazer", "xtable", "stargazer", "scales", "plm", "stringr", "knitr", "kableExtra", "modelsummary", "tibble", "broom.helpers")
+
+install_if_missing <- function(packages) {
+  installed_packages <- installed.packages()[, "Package"]
+  for (pkg in packages) {
+    if (!(pkg %in% installed_packages)) {
+      install.packages(pkg)
+    }
+  }
+}
+
+install_if_missing(packages)
+
+invisible(lapply(packages, function(pkg) {
+  suppressMessages(library(pkg, character.only = TRUE))
+}))
+
+rm(packages, install_if_missing)
+```
+
+# Base
+
+Importamos las base de datos y clasificamos municipalidades mineras y no mineras
+```{r import}
+Dutch <- read_dta("Dutch.dta")
+
+Dutch <- Dutch %>% 
+  mutate(Municipalidad = ifelse(comuna %in% 
+  (Dutch %>% filter(year == 1998, smc > quantile((Dutch %>% filter(year==1998))$smc, 0.75, na.rm = TRUE)) %>% select(comuna))$comuna,"Minera", "No minera"))
+```
+
+# Gráficos
+
+```{r fun}
+crear_grafico_sector <- function(data, sector_col, sector_name, colors, add_ci = FALSE) {
+  
+  data_summarized <- data %>%
+    group_by(year, Municipalidad) %>%
+    summarise(
+      Empleo = mean({{ sector_col }}, na.rm = TRUE),
+      sd = if (add_ci) sd({{ sector_col }}, na.rm = TRUE) else NA,
+      n = if (add_ci) sum(!is.na({{ sector_col }})) else NA
+    ) %>%
+    mutate(
+      se = if (add_ci) sd / sqrt(n) else NA,
+      lower_ci = if (add_ci) Empleo - qt(0.975, df = n - 1) * se else NA,
+      upper_ci = if (add_ci) Empleo + qt(0.975, df = n - 1) * se else NA,
+      Municipalidad = as.factor(Municipalidad)
+    )
+  
+  plot <- ggplot(data_summarized, aes(x = year, y = Empleo, color = Municipalidad, fill = Municipalidad)) +
+    geom_rect(aes(xmin = 2006, xmax = 2011, ymin = -Inf, ymax = Inf),
+              fill = "lightgrey", alpha = 0.2, inherit.aes = FALSE) +
+    geom_point(alpha = 0.5, show.legend = FALSE) +
+    geom_line(show.legend = TRUE) +
+    scale_x_continuous(breaks = c(1998, 2000, 2003, 2006, 2009, 2011, 2013), name = "Año") +
+    scale_y_continuous(labels = scales::comma) +
+    scale_color_manual(values = colors) +
+    scale_fill_manual(values = colors) +
+    labs(color = "Municipalidad", y = "Salario promedio (CLP)") +
+    theme(
+      text = element_text(family = "Times", size = 14),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 14),
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12),
+      panel.grid = element_blank()
+    )
+  
+  if (add_ci) {
+    plot <- plot + geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci), alpha = 0.2, color = NA)
+  }
+  
+  return(plot)
+}
+```
+
+```{r graf}
+# usar función para gráficos
+GRAFICO_1 <- crear_grafico_sector(Dutch, sman, "Manufacturero", c("red", "blue", "green", "purple", "orange"))
+GRAFICO_2 <- crear_grafico_sector(Dutch, sserv, "Servicios", c("blue", "red", "green", "purple", "orange"))
+GRAFICO_3 <- crear_grafico_sector(Dutch, sal_manu, "Manufacturero", c("red", "blue", "green", "purple", "orange"), add_ci = TRUE)
+GRAFICO_4 <- crear_grafico_sector(Dutch, sal_const, "Construcción", c("red", "blue", "green", "purple", "orange"), add_ci = TRUE)
+GRAFICO_5 <- crear_grafico_sector(Dutch, sal_com, "Comercio", c("red", "blue", "green", "purple", "orange"), add_ci = TRUE)
+
+# Exportamos los gráficos
+ggsave("img/GRAFICO_1.png", plot = GRAFICO_1, width = 10, height = 6, dpi = 300)
+ggsave("img/GRAFICO_2.png", plot = GRAFICO_2, width = 10, height = 6, dpi = 300)
+ggsave("img/GRAFICO_3.png", plot = GRAFICO_3, width = 10, height = 6, dpi = 300)
+ggsave("img/GRAFICO_4.png", plot = GRAFICO_4, width = 10, height = 6, dpi = 300)
+ggsave("img/GRAFICO_5.png", plot = GRAFICO_5, width = 10, height = 6, dpi = 300)
+
+rm(GRAFICO_1, GRAFICO_2, GRAFICO_3, GRAFICO_4, GRAFICO_5)
+```
+
+# Regresiones
+
+Preparar base
+```{r base}
+# exposición al shock 
+smc_1998 <- Dutch %>%
+  filter(year == 1998) %>%
+  select(comuna, smc)
+
+Dutch <- Dutch %>%
+  left_join(smc_1998, by = "comuna", suffix = c("", "_1998")) %>%
+  mutate(expo = smc_1998)  # Crear la nueva columna `exposición`
+
+Dutch <- Dutch %>% 
+  mutate(log_sal_manu = log(sal_manu),
+         log_sal_com = log(sal_com), 
+         log_sal_cont = log(sal_const))
+
+# base a panel
+Dutch_panel <- pdata.frame(Dutch, index = c("comuna", "year"))
+rm(smc_1998, Dutch)
+```
+
+Regresiones con controles
+```{r reg}
+# Empleo manufactura
+manu1 <- plm(sman ~ logp * expo, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+manu2 <- plm(sman ~ logp * expo + g3r, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+manu3 <- plm(sman ~ logp * expo + g3r + lesc, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+manu4 <- plm(sman ~ logp * expo + g3r + lesc + share_urbano, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+manu5 <- plm(sman ~ logp * expo + g3r + lesc + share_urbano + sp, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+
+manu_empleo <- list(manu1, manu2, manu3, manu4, manu5)
+rm(manu1, manu2, manu3, manu4, manu5)
+
+# Empleo servicios
+serv1 <- plm(sserv ~ logp * expo, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+serv2 <- plm(sserv ~ logp * expo + g3r, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+serv3 <- plm(sserv ~ logp * expo + g3r + lesc, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+serv4 <- plm(sserv ~ logp * expo + g3r + lesc + share_urbano, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+serv5 <- plm(sserv ~ logp * expo + g3r + lesc + share_urbano + sp, 
+             data = Dutch_panel, 
+             index = c("comuna", "year"), 
+             model = "within", effect = "twoways")
+
+serv_empleo <- list(serv1, serv2, serv3, serv4, serv5)
+rm(serv1, serv2, serv3, serv4, serv5)
+
+# salario manufactura
+salmanu1 <- plm(log_sal_manu ~ logp * expo, 
+                data = Dutch_panel, 
+                index = c("comuna", "year"), 
+                model = "within", 
+                effect = "twoways")
+salmanu2 <- plm(log_sal_manu ~ logp * expo + g3r, 
+                data = Dutch_panel, 
+                index = c("comuna", "year"), 
+                model = "within", 
+                effect = "twoways")
+salmanu3 <- plm(log_sal_manu ~ logp * expo + g3r + lesc, 
+                data = Dutch_panel, 
+                index = c("comuna", "year"), 
+                model = "within", 
+                effect = "twoways")
+salmanu4 <- plm(log_sal_manu ~ logp * expo + g3r + lesc + share_urbano, 
+                data = Dutch_panel, 
+                index = c("comuna", "year"), 
+                model = "within", 
+                effect = "twoways")
+salmanu5 <- plm(log_sal_manu ~ logp * expo + g3r + lesc + share_urbano + sp, 
+                data = Dutch_panel, 
+                index = c("comuna", "year"), 
+                model = "within", 
+                effect = "twoways")
+
+manu_salario <- list(salmanu1, salmanu2, salmanu3, salmanu4, salmanu5)
+rm(salmanu1, salmanu2, salmanu3, salmanu4, salmanu5)
+
+# salario construcción
+salcon1 <- plm(log_sal_cont ~ logp * expo, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcon2 <- plm(log_sal_cont ~ logp * expo + g3r, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcon3 <- plm(log_sal_cont ~ logp * expo + g3r + lesc, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcon4 <- plm(log_sal_cont ~ logp * expo + g3r + lesc + share_urbano, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcon5 <- plm(log_sal_cont ~ logp * expo + g3r + lesc + share_urbano + sp, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+
+const_salario <- list(salcon1, salcon2, salcon3, salcon4, salcon5)
+rm(salcon1, salcon2, salcon3, salcon4, salcon5)
+
+# salario comercio
+salcom1 <- plm(log_sal_com ~ logp * expo, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcom2 <- plm(log_sal_com ~ logp * expo + g3r, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcom3 <- plm(log_sal_com ~ logp * expo + g3r + lesc, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcom4 <- plm(log_sal_com ~ logp * expo + g3r + lesc + share_urbano, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+salcom5 <- plm(log_sal_com ~ logp * expo + g3r + lesc + share_urbano + sp, 
+               data = Dutch_panel, 
+               index = c("comuna", "year"), 
+               model = "within", 
+               effect = "twoways")
+
+# Almacenar los modelos en una lista
+comercio_salario <- list(salcom1, salcom2, salcom3, salcom4, salcom5)
+
+# Eliminar objetos individuales para limpiar el entorno
+rm(salcom1, salcom2, salcom3, salcom4, salcom5)
+```
+
+# Export LaTeX P3
+
+Formato para tablas
+```{r format latex}
+tags <- c('sman'    = "Proporción empleo manufacturero",
+         'sserv'   = 'Empleo servicios',
+         'logp'    = 'Log Precios',
+         'expo'   = 'Exposición',
+         'logp:expo'  = 'Log Precios:Exposición',
+         'g3r'     = 'Crec. PIB región',
+         'share_urbano' = 'Población urbana (\\%)',
+         'lesc'    = 'Log Años escolaridad',
+         'log_sal_manu' = 'Log Salarios sector manufacturas',
+         'log_sal_com' = 'Log Salarios sector construcción',
+         'log_sal_cont' = 'Log Salarios sector comercial',
+         "sp" = "Tasa de pobreza",
+         "log(tcr)" = "Log Tipo de cambio t",
+         "log(lagged_period)" = "Log Tipo de cambio t-1"
+)
+
+ajuste <- list(
+    list("raw" = "nobs", "clean" = "Observaciones", "fmt" = 0),
+    list("raw" = "r.squared", "clean" = "R$^2$", "fmt" = 2),
+    list("raw" = "adj.r.squared", "clean" = "$R^2$ ajustado", "fmt" = 2)
+)
+
+rows <- tribble(
+    ~term,                   ~"(1)",          ~"(2)", ~"(3)", ~"(4)", ~"(5)",
+    'Efecto fijo comuna', '\\Checkmark',   '\\Checkmark',  '\\Checkmark',  '\\Checkmark', '\\Checkmark',
+    'Efecto fijo año', '\\Checkmark', '\\Checkmark',  '\\Checkmark',  '\\Checkmark', '\\Checkmark'
+)
+
+attr(rows, 'position') <- c(11,12)
+```
+
+función export
+```{r}
+reg_tex <- function(model_list, table_title) {
+  # Generar la tabla LaTeX con msummary y añadir el encabezado
+  table_tex <- msummary(model_list,     
+                        vcov = "HC1",
+                        fmt = 3,
+                        estimate = "{estimate}{stars}",  # Incluye los asteriscos de significancia
+                        statistic = "[{std.error}]",
+                        coef_map = tags, 
+                        gof_omit = 'AIC|BIC|RMSE|Within|FE',
+                        gof_map = ajuste,
+                        add_rows = rows,
+                        align = "lccccc",  # Ajuste del alineamiento de columnas
+                        output = "latex",
+                        escape = FALSE
+  ) %>%
+    add_header_above(c(" " = 1,
+                       table_title = 5),
+                     escape = FALSE
+    )
+  
+  return(table_tex)
+}
+
+```
+
+empleo - manufacturero
+```{r}
+t_manu_empleo <- reg_tex(manu_empleo, "(\\%) Empleo sector manufacturero")
+
+t_manu_empleo <- paste0("\\begin{table}[H]\n", 
+                   "\\caption{Efecto de los precios de los metales sobre la proporción del empleo manufacturero.}\n", 
+                   "\\label{tab:manu_empleo}\n", 
+                   t_manu_empleo, 
+                   "\\end{table}\n")
+
+writeLines(t_manu_empleo, "tex/Manufactura_Empleo.tex")
+```
+
+empleo - servicios
+```{r}
+t_serv_empleo <- reg_tex(serv_empleo, "(\\%) Empleo sector servicios")
+
+t_serv_empleo <- paste0("\\begin{table}[H]\n", 
+                   "\\caption{Efecto de los precios de los metales sobre la proporción del empleo en el sector servicios.}\n", 
+                   "\\label{tab:serv_empleo}\n", 
+                   t_serv_empleo, 
+                   "\\end{table}\n")
+
+writeLines(t_serv_empleo, "tex/Servicios_Empleo.tex")
+```
+
+salario - manufacturero 
+```{r}
+t_manu_salario <- reg_tex(manu_salario, "Log Salarios manufacturero")
+
+t_manu_salario <- paste0("\\begin{table}[H]\n", 
+                   "\\caption{Efecto de los precios de los metales sobre los salarios en el sector manufacturero.}\n", 
+                   "\\label{tab:manu_salario}\n", 
+                   t_manu_salario, 
+                   "\\end{table}\n")
+
+writeLines(t_manu_salario, "tex/Manufactura_Salario.tex")
+```
+
+salario - construcción
+```{r}
+t_const_salario <- reg_tex(const_salario, "Log Salarios construcción")
+
+t_const_salario <- paste0("\\begin{table}[H]\n", 
+                   "\\caption{Efecto de los precios de los metales sobre los salarios en el sector de la construcción.}\n", 
+                   "\\label{tab:const_salario}\n", 
+                   t_const_salario, 
+                   "\\end{table}\n")
+
+writeLines(t_const_salario, "tex/Construcción_Salario.tex")
+```
+
+salario - comercio
+```{r}
+t_comercio_salario <- reg_tex(comercio_salario, "Log Salarios comercio")
+
+t_comercio_salario <- paste0("\\begin{table}[H]\n", 
+                   "\\caption{Efecto de los precios de los metales sobre los salarios en el sector del comercio.}\n", 
+                   "\\label{tab:comercio_salario}\n", 
+                   t_comercio_salario, 
+                   "\\end{table}\n")
+
+writeLines(t_comercio_salario, "tex/Comercio_Salario.tex")
+```
+
+# Efecto Apreciación cambiaria
+
+```{r}
+year_pairs <- list(
+  c(1998, 2000),
+  c(2000, 2003),
+  c(2003, 2006),
+  c(2006, 2009),
+  c(2009, 2011),
+  c(2011, 2013)
+)
+
+# Inicializar la columna lagged_period en NA
+Dutch_panel <- Dutch_panel %>%
+  mutate(lagged_period = NA)
+
+# Recorrer los pares de años para asignar los valores de tcr correspondientes
+for (pair in year_pairs) {
+  base_year <- pair[1]
+  target_year <- pair[2]
+  
+  # Filtrar el valor de tcr para el base_year
+  tcr_base <- Dutch_panel %>%
+    filter(year == base_year) %>%
+    select(comuna, tcr) %>%
+    rename(tcr_base = tcr)
+  
+  # Unir y asignar el valor de tcr_base al target_year en lagged_period
+  Dutch_panel <- Dutch_panel %>%
+    left_join(tcr_base, by = "comuna") %>%
+    mutate(lagged_period = ifelse(year == target_year, tcr_base, lagged_period)) %>%
+    select(-tcr_base)
+}
+
+
+
+reg <- plm(log_sal_manu ~ log(tcr), 
+               data = Dutch_panel, 
+               index = "comuna", 
+               model = "within")
+
+reg_control <- plm(log_sal_manu ~ log(tcr) + g3r + lesc + share_urbano + sp, 
+               data = Dutch_panel, 
+               index = c("comuna"), 
+               model = "within")
+
+reg_l <- plm(log_sal_manu ~ log(lagged_period), 
+               data = Dutch_panel, 
+               index = "comuna", 
+               model = "within")
+
+reg_control_l <- plm(log_sal_manu ~ log(lagged_period) + g3r + lesc + share_urbano + sp, 
+               data = Dutch_panel, 
+               index = c("comuna"), 
+               model = "within")
+
+lag_modelos <- list(reg, reg_control,reg_l, reg_control_l)
+
+rows <- tribble(
+    ~term,                   ~"(1)",          ~"(2)", ~"(3)", ~"(4)",
+    'Efecto fijo comuna', '\\Checkmark',   '\\Checkmark',  '\\Checkmark',  '\\Checkmark'
+)
+
+attr(rows, 'position') <- c(13)
+
+reg_tex_p5 <- function(model_list, table_title) {
+  # Generar la tabla LaTeX con msummary y añadir el encabezado
+  table_tex <- msummary(model_list,     
+                        vcov = "HC1",
+                        fmt = 3,
+                        estimate = "{estimate}{stars}",  # Incluye los asteriscos de significancia
+                        statistic = "[{std.error}]",
+                        coef_map = tags, 
+                        gof_omit = 'AIC|BIC|RMSE|Within|FE',
+                        gof_map = ajuste,
+                        add_rows = rows,
+                        align = "lcccc",  # Ajuste del alineamiento de columnas
+                        output = "latex",
+                        escape = FALSE
+  ) %>%
+    add_header_above(c(" " = 1,
+                       "(\\%) Empleo Manufacturero" = 4),
+                     escape = FALSE
+    )
+  
+  return(table_tex)
+}
+
+t_lag_modelos <- reg_tex_p5(lag_modelos, "Empleo Manufacturas")
+
+t_lag_modelos <- paste0("\\begin{table}[H]\n", 
+                   "\\caption{Efecto de los precios de los metales sobre los salarios en el sector manufacturero, modelo laggeado.}\n", 
+                   "\\label{tab:lag_modelos}\n", 
+                   t_lag_modelos, 
+                   "\\end{table}\n")
+
+writeLines(t_lag_modelos, "tex/Manufactura_Empleo_Lag.tex")
+
+```
+
+
+
